@@ -444,7 +444,115 @@ export function parseNodeInfo(nodeUrl) {
             const parsed = parseHostPort(serverPart);
             server = parsed.server;
             port = parsed.port;
-        } else {
+        } else if (protocol === 'ssr') {
+            // SSR 格式: ssr://base64(server:port:protocol:method:obfs:base64(password)/?params)
+            // params 中包含 remarks=base64(name), obfsparam=..., protoparam=...
+            try {
+                let payload = nodeUrl.substring(6); // 去掉 ssr://
+                // 去掉可能存在的 # fragment
+                const hIdx = payload.indexOf('#');
+                if (hIdx !== -1) payload = payload.substring(0, hIdx);
+                // 去掉外层查询参数（不常见但防御性处理）
+                const qIdx = payload.indexOf('?');
+                if (qIdx !== -1) payload = payload.substring(0, qIdx);
+
+                const decoded = tryDecodeBase64(payload);
+                if (decoded) {
+                    // 解析 server:port:protocol:method:obfs:password_base64/?params
+                    // server 可能是 IPv6 [::1]
+                    let ssrServer = '', ssrPort = '';
+                    if (decoded.startsWith('[')) {
+                        // IPv6 格式: [ipv6]:port:...
+                        const closeBracket = decoded.indexOf(']');
+                        if (closeBracket !== -1) {
+                            ssrServer = decoded.substring(1, closeBracket);
+                            const afterBracket = decoded.substring(closeBracket + 1);
+                            const portMatch = afterBracket.match(/^:(\d+):/);
+                            if (portMatch) ssrPort = portMatch[1];
+                        }
+                    } else {
+                        // IPv4/domain 格式: host:port:...
+                        const colonParts = decoded.split(':');
+                        if (colonParts.length >= 2) {
+                            ssrServer = colonParts[0];
+                            ssrPort = colonParts[1];
+                        }
+                    }
+                    server = ssrServer;
+                    port = ssrPort;
+
+                    // 提取 remarks 名称（SSR 名称在 Base64 编码的 remarks 参数中）
+                    const slashQ = decoded.indexOf('/?');
+                    const paramStart = slashQ !== -1 ? slashQ + 2 : (decoded.indexOf('?') !== -1 ? decoded.indexOf('?') + 1 : -1);
+                    if (paramStart !== -1) {
+                        const paramStr = decoded.substring(paramStart);
+                        const remarksMatch = paramStr.match(/(?:^|&)remarks=([^&]*)/);
+                        if (remarksMatch && remarksMatch[1]) {
+                            const remarksB64 = remarksMatch[1].replace(/\s+/g, '');
+                            // remarks 通常包含中文，需要 UTF-8 安全解码
+                            try {
+                                const normalized = normalizeBase64(remarksB64);
+                                const binaryString = atob(normalized);
+                                const bytes = new Uint8Array(binaryString.length);
+                                for (let i = 0; i < binaryString.length; i++) {
+                                    bytes[i] = binaryString.charCodeAt(i);
+                                }
+                                const remarksDecoded = new TextDecoder('utf-8').decode(bytes);
+                                if (remarksDecoded) {
+                                    nodeName = remarksDecoded.trim();
+                                }
+                            } catch (e) {
+                                // Base64 解码失败，尝试使用原始值
+                                const fallback = tryDecodeBase64(remarksB64);
+                                if (fallback) nodeName = fallback.trim();
+                            }
+                        }
+                    }
+                }
+} catch (e) {
+console.debug('[GeoUtils] SSR decode failed:', e);
+}
+} else if (protocol === 'wireguard') {
+// WireGuard 格式: wireguard://privatekey@server:port?params#name
+let body = nodeUrl.substring('wireguard://'.length);
+
+// 提取名称
+const hIndex = body.indexOf('#');
+if (hIndex !== -1) {
+try {
+nodeName = decodeURIComponent(body.substring(hIndex + 1));
+} catch (e) {
+nodeName = body.substring(hIndex + 1);
+}
+body = body.substring(0, hIndex);
+}
+
+// 提取服务器和端口
+const atIndex = body.lastIndexOf('@');
+if (atIndex !== -1) {
+const serverPart = body.substring(atIndex + 1);
+const qIndex = serverPart.indexOf('?');
+const addrPart = qIndex !== -1 ? serverPart.substring(0, qIndex) : serverPart;
+
+// 处理 IPv6
+if (addrPart.startsWith('[')) {
+const closeBracket = addrPart.indexOf(']');
+if (closeBracket !== -1) {
+server = addrPart.substring(1, closeBracket);
+const afterBracket = addrPart.substring(closeBracket + 1);
+if (afterBracket.startsWith(':')) {
+port = afterBracket.substring(1);
+}
+}
+} else {
+const parts = addrPart.split(':');
+if (parts.length >= 2) {
+server = parts[0];
+port = parts[1];
+}
+}
+}
+} else {
             // 通用格式: protocol://user@host:port... 或 protocol://host:port...
             // vless, trojan, hysteria2, socks5, http 等
             // 去掉 protocol://

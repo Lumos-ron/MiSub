@@ -1,8 +1,62 @@
 const DEFAULT_SUBCONVERTER_FALLBACKS = [
+    'sub.d1.mk', // [Changed] Prioritize d1.mk
     'subapi.cmliussss.net',
-    'sub.d1.mk',
     'sub.xeton.dev'
 ];
+
+const YAML_UNSAFE_CONTROL_CHARS = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/gu;
+
+/**
+ * 清理会破坏 YAML/配置解析的控制字符。
+ * 保留 Unicode 字符（含中文/emoji），避免误伤节点名称。
+ * @param {string} content - 原始配置内容
+ * @returns {{content: string, replacedCount: number}}
+ */
+export function sanitizeConvertedSubscriptionContent(content) {
+    if (typeof content !== 'string' || content.length === 0) {
+        return { content: content || '', replacedCount: 0 };
+    }
+
+    let replacedCount = 0;
+    const sanitized = content.replace(YAML_UNSAFE_CONTROL_CHARS, () => {
+        replacedCount += 1;
+        return '';
+    });
+
+    return { content: sanitized, replacedCount };
+}
+
+/**
+ * 构建返回给客户端的响应头
+ * @param {Headers} backendHeaders
+ * @param {string} subName
+ * @param {string} targetFormat
+ * @param {Object} cacheHeaders
+ * @returns {Headers}
+ */
+export function buildClientResponseHeaders(backendHeaders, subName, targetFormat = '', cacheHeaders = {}) {
+    // [修正] 不再拷贝后端所有头信息，避免透传 subscription-userinfo 等头导致
+    // FlClash 等客户端解析崩溃（Dart RangeError）。
+    const responseHeaders = new Headers();
+
+    responseHeaders.set('Content-Disposition', `attachment; filename*=utf-8''${encodeURIComponent(subName)}`);
+    
+    // 根据目标格式设置 Content-Type
+    if (targetFormat.includes('clash')) {
+        responseHeaders.set('Content-Type', 'text/yaml; charset=utf-8');
+    } else {
+        responseHeaders.set('Content-Type', 'text/plain; charset=utf-8');
+    }
+
+    responseHeaders.set('Cache-Control', 'no-store, no-cache');
+
+    // 仅保留安全的、MiSub 自定义的缓存状态头
+    Object.entries(cacheHeaders).forEach(([key, value]) => {
+        responseHeaders.set(key, value);
+    });
+
+    return responseHeaders;
+}
 
 /**
  * 构建 SubConverter 请求的基础 URL，兼容带/不带协议的配置
@@ -78,21 +132,6 @@ export function getSubconverterCandidates(primary) {
         .filter((item, index, arr) => item !== '' && arr.indexOf(item) === index);
 }
 
-/**
- * 从 Subconverter 获取转换后的订阅
- * @param {string[]} candidates - 后端 URL 列表
- * @param {Object} options - 请求选项
- * @param {string} options.targetFormat - 目标格式
- * @param {string} options.callbackUrl - 回调 URL (for conversion)
- * @param {string|null} options.subConfig - 外部配置 URL
- * @param {string} options.subName - 订阅名称 (for filename)
- * @param {Object} options.cacheHeaders - 需要透传的缓存头
- * @param {boolean} [options.enableScv=false] - 是否禁用证书校验
- * @param {boolean} [options.enableUdp=false] - 是否启用 UDP
- * @param {number} [options.timeout=15000] - 单次请求超时时间(ms)
- * @returns {Promise<{response: Response, usedEndpoint: string}>}
- * @throws {Error} 如果所有尝试都失败
- */
 export async function fetchFromSubconverter(candidates, options) {
     const {
         targetFormat,
@@ -102,88 +141,156 @@ export async function fetchFromSubconverter(candidates, options) {
         cacheHeaders = {},
         enableScv = false,
         enableUdp = false,
+        enableEmoji = false,
         timeout = 15000
     } = options;
 
-    const triedEndpoints = [];
-    let lastError = null;
+    console.log(`[SubConverter Start] Candidates: ${JSON.stringify(candidates)}`);
 
+    // 展平所有的变体成一个一维数组
+    const allVariants = [];
     for (const backend of candidates) {
-        const variants = buildSubconverterUrlVariants(backend);
+        allVariants.push(...buildSubconverterUrlVariants(backend));
+    }
 
-        for (const subconverterUrl of variants) {
-            triedEndpoints.push(subconverterUrl.origin + subconverterUrl.pathname);
+    if (allVariants.length === 0) {
+        throw new Error('No valid subconverter backend candidates');
+    }
 
-            try {
-                // Build Query Params
-                subconverterUrl.searchParams.set('target', targetFormat);
-                subconverterUrl.searchParams.set('url', callbackUrl);
-                if (enableScv) {
-                    subconverterUrl.searchParams.set('scv', 'true');
+    const HEDGE_DELAY_MS = 1500; // 错峰时间 1.5 秒
+    const controllers = [];
+    const errors = [];
+
+    return new Promise((resolve, reject) => {
+        let isResolved = false;
+        let activeCount = 0;
+        let index = 0;
+        let nextTimer = null;
+
+        const attemptNext = () => {
+            if (isResolved) return;
+
+            if (index >= allVariants.length) {
+                if (activeCount === 0) {
+                    reject(new Error(`All subconverter attempts failed. Tried: ${allVariants.map(v => v.origin).join(', ')}. Errors: ${errors.map(e => e.message).join(' | ')}`));
                 }
-                if (enableUdp) {
-                    subconverterUrl.searchParams.set('udp', 'true');
-                }
+                return;
+            }
 
-                if ((targetFormat === 'clash' || targetFormat === 'loon' || targetFormat === 'surge') &&
-                    subConfig && subConfig.trim() !== '') {
-                    subconverterUrl.searchParams.set('config', subConfig);
-                }
+            const subconverterUrl = allVariants[index++];
+            activeCount++;
 
-                // [Fixed] Do not force 'new_name=true' as it causes Subconverter to reorder/rename nodes
-                // subconverterUrl.searchParams.set('new_name', 'true');
+            const controller = new AbortController();
+            controllers.push(controller);
+            let reqTimeoutId = null;
 
-                // Timeout Control
-                const controller = new AbortController();
-                const timeoutId = setTimeout(() => controller.abort(), timeout);
-
-                let response;
+            (async () => {
                 try {
-                    response = await fetch(subconverterUrl.toString(), {
+                    // 构建查询参数
+                    subconverterUrl.searchParams.set('target', targetFormat);
+                    subconverterUrl.searchParams.set('url', callbackUrl);
+                    if (enableScv) subconverterUrl.searchParams.set('scv', 'true');
+                    if (enableUdp) subconverterUrl.searchParams.set('udp', 'true');
+                    subconverterUrl.searchParams.set('emoji', enableEmoji ? 'true' : 'false');
+
+                    if ((targetFormat === 'clash' || targetFormat === 'loon' || targetFormat.startsWith('surge')) &&
+                        subConfig && subConfig.trim() !== '') {
+                        subconverterUrl.searchParams.set('config', subConfig);
+                    }
+
+                    // 单个请求的绝对生命周期
+                    reqTimeoutId = setTimeout(() => controller.abort(), timeout);
+
+                    const response = await fetch(subconverterUrl.toString(), {
                         method: 'GET',
                         headers: { 'User-Agent': 'Mozilla/5.0 (compatible; MiSub-Backend)' },
                         signal: controller.signal
                     });
+
+                    if (!response.ok) {
+                        const errorBody = await response.text();
+                        throw new Error(`Status ${response.status}: ${errorBody}`);
+                    }
+
+                    // 处理响应...
+                    let responseText = await response.text();
+                    let isBase64 = false;
+                    let decodedText = responseText;
+
+                    if (!responseText.includes('\n') && /^[A-Za-z0-9+/=]+$/.test(responseText.trim())) {
+                        try {
+                            const rawDecoded = atob(responseText.trim());
+                            if (rawDecoded.includes('proxies:') || rawDecoded.includes('name:')) {
+                                decodedText = rawDecoded;
+                                isBase64 = true;
+                            }
+                        } catch (e) {
+                            // 不做处理，保持非Base64
+                        }
+                    }
+
+                    const { content: sanitizedText, replacedCount } = sanitizeConvertedSubscriptionContent(decodedText);
+                    if (replacedCount > 0) {
+                        console.log(`[MiSub Sanitize] Removed ${replacedCount} unsafe control chars. Base64: ${isBase64}`);
+                    }
+                    
+                    // [修正] 只有目标格式明确要求是 base64 时才返回 base64。
+                    // 以前的逻辑是：如果后端返回了 base64，我们就再转回去。
+                    // 但对于 Clash 等客户端，即使后端由于某种原因返回了 base64，MiSub 也应该解码成明文发给客户端。
+                    responseText = (targetFormat === 'base64') ? btoa(sanitizedText) : sanitizedText;
+
+                    if (responseText.trim().startsWith('<!DOCTYPE html>') || responseText.includes('<html')) {
+                        throw new Error(`Backend returned HTML instead of subscription. Prefix: ${responseText.slice(0, 100)}`);
+                    }
+
+                    const responseHeaders = buildClientResponseHeaders(response.headers, subName, targetFormat, cacheHeaders);
+
+                    if (!isResolved) {
+                        isResolved = true;
+                        if (nextTimer) clearTimeout(nextTimer);
+                        
+                        // 结束并清理其他竞态请求
+                        controllers.forEach(c => {
+                            if (c !== controller) c.abort();
+                        });
+
+                        resolve({
+                            response: new Response(responseText, {
+                                status: 200,
+                                statusText: 'OK',
+                                headers: responseHeaders
+                            }),
+                            usedEndpoint: subconverterUrl.origin
+                        });
+                    }
+
+                } catch (error) {
+                    if (error.name !== 'AbortError') {
+                        errors.push(error);
+                        console.warn(`[SubConverter Error] Backend: ${subconverterUrl.origin} | Msg: ${error.message}`);
+                    }
                 } finally {
-                    clearTimeout(timeoutId);
+                    if (reqTimeoutId) clearTimeout(reqTimeoutId);
+                    activeCount--;
+                    
+                    // 如果自己失败了，但在超时前，立刻尝试下一个
+                    if (!isResolved && activeCount === 0 && index < allVariants.length) {
+                        if (nextTimer) clearTimeout(nextTimer);
+                        attemptNext();
+                    } else if (!isResolved && activeCount === 0 && index >= allVariants.length) {
+                        // 彻底所有请求都失败完毕
+                        reject(new Error(`All subconverter attempts failed. Tried: ${allVariants.map(v => v.origin).join(', ')}. Errors: ${errors.map(e => e.message).join(' | ')}`));
+                    }
                 }
+            })();
 
-                if (!response.ok) {
-                    const errorBody = await response.text();
-                    throw new Error(`Status ${response.status}: ${errorBody}`);
-                }
-
-                // Success! Prepare Response
-                const responseText = await response.text();
-                const responseHeaders = new Headers(response.headers);
-
-                // Set Filename
-                responseHeaders.set("Content-Disposition", `attachment; filename*=utf-8''${encodeURIComponent(subName)}`);
-                responseHeaders.set('Content-Type', 'text/plain; charset=utf-8');
-                responseHeaders.set('Cache-Control', 'no-store, no-cache');
-
-                // Pass-through Cache Headers
-                Object.entries(cacheHeaders).forEach(([key, value]) => {
-                    responseHeaders.set(key, value);
-                });
-
-                return {
-                    response: new Response(responseText, {
-                        status: 200,
-                        statusText: 'OK',
-                        headers: responseHeaders
-                    }),
-                    usedEndpoint: subconverterUrl.origin
-                };
-
-            } catch (error) {
-                lastError = error;
-                console.warn(`[SubConverter] Error with backend ${subconverterUrl.origin}: ${error.message}`);
-                // Continue to next variant/candidate
+            // 每隔 HEDGE_DELAY_MS 启动下一个兜底请求 (错峰并发)
+            if (!isResolved && index < allVariants.length) {
+                if (nextTimer) clearTimeout(nextTimer);
+                nextTimer = setTimeout(attemptNext, HEDGE_DELAY_MS);
             }
-        }
-    }
+        };
 
-    // If we get here, all failed
-    throw new Error(`${lastError ? lastError.message : 'Unknown error'}. Tried: ${triedEndpoints.join(', ')}`);
+        attemptNext();
+    });
 }

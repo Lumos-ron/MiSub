@@ -178,6 +178,11 @@ export async function handleApiRequest(request, env) {
         return await handleGithubReleaseRequest(request, env);
     }
 
+    // Logout 无需认证（cookie 过期时也需能正常登出）
+    if (path === '/logout') {
+        return await handleLogout(request);
+    }
+
     if (!await authMiddleware(request, env)) {
         return createJsonResponse({ error: 'Unauthorized' }, 401);
     }
@@ -204,9 +209,6 @@ export async function handleApiRequest(request, env) {
 
 
     switch (path) {
-        case '/logout':
-            return await handleLogout(request);
-
         case '/misubs':
             return await handleMisubsSave(request, env);
 
@@ -330,12 +332,13 @@ async function handleExternalFetchRequest(request, env) {
                 'Cache-Control': 'no-cache'
             },
             redirect: "follow",
+            signal: controller.signal
+        }), {
             cf: {
                 insecureSkipVerify: true,
                 timeout: timeout / 1000 // Cloudflare timeout in seconds
-            },
-            signal: controller.signal
-        }));
+            }
+        });
 
         clearTimeout(timeoutId);
 

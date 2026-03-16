@@ -5,7 +5,7 @@
 
 import { parseNodeList } from '../modules/utils/node-parser.js';
 import { getProcessedUserAgent } from '../utils/format-utils.js';
-import { prependNodeName, removeFlagEmoji, fixNodeUrlEncoding } from '../utils/node-utils.js';
+import { prependNodeName, removeFlagEmoji, fixNodeUrlEncoding, sanitizeNodeForYaml } from '../utils/node-utils.js';
 import { applyNodeTransformPipeline } from '../utils/node-transformer.js';
 import { createTimeoutFetch } from '../modules/utils.js';
 
@@ -136,8 +136,11 @@ function createConcurrencyLimiter(limit) {
  * @returns {Promise<string>} - 组合后的节点列表
  */
 export async function generateCombinedNodeList(context, config, userAgent, misubs, prependedContent = '', profilePrefixSettings = null, debug = false) {
-    // 判断是否启用手动节点前缀
-    const shouldPrependManualNodes = profilePrefixSettings?.enableManualNodes ?? true;
+// 判断是否启用手动节点前缀
+const shouldPrependManualNodes = profilePrefixSettings?.enableManualNodes ?? true;
+
+// 判断是否在节点名称前添加分组名称
+const prependGroupName = profilePrefixSettings?.prependGroupName ?? false;
 
     // 判断是否需要添加 Emoji：当模板重命名启用且模板包含 {emoji} 时启用
     const nodeTransformConfig = profilePrefixSettings?.nodeTransform;
@@ -155,26 +158,50 @@ export async function generateCombinedNodeList(context, config, userAgent, misub
     // 用户可以在模板中使用 {name} 变量来保留原始信息
     const skipPrefixDueToRenaming = nodeTransformConfig?.enabled && nodeTransformConfig?.rename?.template?.enabled;
 
-    const processedManualNodes = misubs.filter(sub => !sub.url.toLowerCase().startsWith('http')).map(node => {
-        if (node.isExpiredNode) {
-            return node.url; // Directly use the URL for expired node
-        } else {
-            // 修复手动SS节点中的URL编码问题（以及 Hysteria2 等其他协议）
-            let processedUrl = fixNodeUrlEncoding(node.url);
+const processedManualNodes = misubs
+.filter(sub => {
+const url = typeof sub?.url === 'string' ? sub.url.trim() : '';
+return Boolean(url) && !url.toLowerCase().startsWith('http');
+})
+.map(node => {
+try {
+const rawUrl = typeof node?.url === 'string' ? node.url.trim() : '';
+if (!rawUrl) return '';
 
-            // 如果用户设置了手动节点名称，则替换链接中的原始名称
-            const customNodeName = typeof node.name === 'string' ? node.name.trim() : '';
-            if (customNodeName) {
-                processedUrl = applyManualNodeName(processedUrl, customNodeName);
-            }
+if (node.isExpiredNode) {
+return rawUrl; // Directly use the URL for expired node
+}
 
-            // 只有在智能重命名未启用时才添加前缀
-            const shouldAddPrefix = shouldPrependManualNodes && !skipPrefixDueToRenaming;
-            return shouldAddPrefix ? prependNodeName(processedUrl, manualNodePrefix) : processedUrl;
-        }
-    }).join('\n');
+// 修复手动SS节点中的URL编码问题（以及 Hysteria2 等其他协议）
+let processedUrl = fixNodeUrlEncoding(rawUrl);
+if (typeof processedUrl !== 'string' || !processedUrl) {
+processedUrl = rawUrl;
+}
 
-    const httpSubs = misubs.filter(sub => sub.url.toLowerCase().startsWith('http'));
+// 如果用户设置了手动节点名称，则替换链接中的原始名称
+const customNodeName = typeof node.name === 'string' ? node.name.trim() : '';
+if (customNodeName) {
+processedUrl = applyManualNodeName(processedUrl, customNodeName);
+}
+
+// 如果启用了分组名称前缀，且节点有分组信息，则添加分组名称
+const nodeGroup = typeof node.group === 'string' ? node.group.trim() : '';
+if (prependGroupName && nodeGroup && !skipPrefixDueToRenaming) {
+processedUrl = prependNodeName(processedUrl, nodeGroup);
+}
+
+// 只有在智能重命名未启用时才添加前缀
+const shouldAddPrefix = shouldPrependManualNodes && !skipPrefixDueToRenaming;
+return shouldAddPrefix ? prependNodeName(processedUrl, manualNodePrefix) : processedUrl;
+} catch (error) {
+console.warn('[Subscription] 手动节点处理失败，已跳过:', error?.message || error);
+return '';
+}
+})
+.filter(Boolean)
+.join('\n');
+
+    const httpSubs = misubs.filter(sub => sub && sub.url && sub.url.toLowerCase().startsWith('http'));
     const limiter = createConcurrencyLimiter(FETCH_CONFIG.CONCURRENCY);
 
     /**
@@ -190,7 +217,18 @@ export async function generateCombinedNodeList(context, config, userAgent, misub
             const processedUserAgent = getProcessedUserAgent(userAgent, sub.url);
             const requestHeaders = { 'User-Agent': processedUserAgent };
 
-            const response = await fetchWithRetry(sub.url, {
+            // [Fetch Proxy] 获取单点订阅专属拉取代理前缀
+            let requestUrl = sub.url;
+            if (sub.fetchProxy && typeof sub.fetchProxy === 'string' && sub.fetchProxy.trim()) {
+                const proxyPrefix = sub.fetchProxy.trim();
+                // 将被代理的 URL 进行编码，拼接到代理前缀之后
+                requestUrl = `${proxyPrefix}${encodeURIComponent(sub.url)}`;
+                if (debug) {
+                    console.debug(`[DEBUG] Fetching via proxy: ${requestUrl}`);
+                }
+            }
+
+            const response = await fetchWithRetry(requestUrl, {
                 headers: requestHeaders,
                 redirect: "follow",
                 cf: {
@@ -201,7 +239,7 @@ export async function generateCombinedNodeList(context, config, userAgent, misub
             });
 
             if (!response.ok) {
-                console.warn(`订阅请求失败: ${sub.url}, 状态: ${response.status}`);
+                console.warn(`订阅请求失败: ${requestUrl}, 状态: ${response.status}`);
                 return '';
             }
             const buffer = await response.arrayBuffer();
@@ -254,9 +292,12 @@ export async function generateCombinedNodeList(context, config, userAgent, misub
         ? combinedLines
         : combinedLines.map(line => removeFlagEmoji(line));
 
+    // [Sanitize] Always sanitize node names for YAML compatibility (Subconverter issue with unquoted special chars)
+    const sanitizedLines = normalizedLines.map(line => sanitizeNodeForYaml(line));
+
     const outputLines = nodeTransformConfig?.enabled
-        ? applyNodeTransformPipeline(normalizedLines, { ...nodeTransformConfig, enableEmoji: templateContainsEmoji })
-        : [...new Set(normalizedLines)];
+        ? applyNodeTransformPipeline(sanitizedLines, { ...nodeTransformConfig, enableEmoji: templateContainsEmoji })
+        : [...new Set(sanitizedLines)];
     const uniqueNodesString = outputLines.join('\n');
 
     // 确保最终的字符串在非空时以换行符结束，以兼容 subconverter
@@ -302,7 +343,10 @@ export async function generateCombinedNodeList(context, config, userAgent, misub
                 geoInfo = context.logMetadata.geoInfo || geoInfo;
             } else if (context && context.request) {
                 const cf = context.request.cf;
-                clientIp = context.request.headers.get('CF-Connecting-IP') || 'Unknown';
+                clientIp = context.request.headers.get('CF-Connecting-IP')
+                    || context.request.headers.get('X-Real-IP')
+                    || context.request.headers.get('X-Forwarded-For')?.split(',')[0]?.trim()
+                    || 'Unknown';
                 if (cf) {
                     geoInfo = {
                         country: cf.country,
